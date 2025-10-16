@@ -1,4 +1,5 @@
 import yfinance as yf
+import pandas as pd
 
 TICKERS = ["PETR4.SA", "AZUL4.SA", "VALE3.SA"]
 START_DATE = "2021-01-02"
@@ -112,27 +113,16 @@ def compute_monthly_returns_from_prices(prices):
         rets.append((p1 / p0) - 1 if p0 else 0.0)
     return rets
 
-
 def CAPM(aligned_returns, common_months, start_date, end_date=None, rf=None):
-    """
-    Calcula Beta e retorno CAPM em base mensal.
-    rf: taxa livre de risco mensal. Se None, converte 5% a.a. para mensal.
-    """
     if rf is None:
-        rf_anual = 0.15  # 15% a.a usando como referência a Selic
+        rf_anual = 0.05
         rf = (1 + rf_anual) ** (1/12) - 1
 
     lista_capm = {}
-
-    # Mercado (Ibovespa)
     months_mkt, prices_mkt = fetch_adj_close_monthly_end("^BVSP", start_date, end_date)
     rets_mkt = compute_monthly_returns_from_prices(prices_mkt)
-
-    # Usar meses de retorno do mercado
     months_mkt_ret = months_mkt[1:]
     idx_mkt_ret = {months_mkt_ret[i]: i for i in range(len(months_mkt_ret))}
-
-    # Alinhar mercado aos meses comuns
     aligned_mkt = [rets_mkt[idx_mkt_ret[m]] for m in common_months if m in idx_mkt_ret]
 
     if not aligned_mkt:
@@ -150,19 +140,59 @@ def CAPM(aligned_returns, common_months, start_date, end_date=None, rf=None):
     return lista_capm
 
 
+def fundamental_analysis(tickers):
+    resultados = []
+
+    for t in tickers:
+        tk = yf.Ticker(t)
+        balanco = tk.balance_sheet
+        dre = tk.financials
+
+        if balanco.empty or dre.empty:
+            print(f"⚠️ Dados contábeis indisponíveis para {t}")
+            continue
+
+        for col in balanco.columns:
+            ano = col.year
+            if ano not in [2021, 2022, 2023, 2024]:
+                continue
+
+            ativo_circulante = balanco.get("Total Current Assets", pd.Series()).get(col, 0)
+            passivo_circulante = balanco.get("Total Current Liabilities", pd.Series()).get(col, 0)
+            estoques = balanco.get("Inventory", pd.Series()).get(col, 0)
+            ativo_total = balanco.get("Total Assets", pd.Series()).get(col, 0)
+            fornecedores = balanco.get("Accounts Payable", pd.Series()).get(col, 0)
+            receita_liquida = dre.get("Total Revenue", pd.Series()).get(col, 0)
+            cogs = dre.get("Cost Of Revenue", pd.Series()).get(col, 0)
+
+            liquidez_corrente = ativo_circulante / passivo_circulante if passivo_circulante else None
+            liquidez_seca = (ativo_circulante - estoques) / passivo_circulante if passivo_circulante else None
+            giro_ativo = receita_liquida / ativo_total if ativo_total else None
+            prazo_medio_pagamento = (fornecedores / cogs * 360) if cogs else None
+
+            resultados.append({
+                "Empresa": t,
+                "Ano": ano,
+                "Liquidez Corrente": liquidez_corrente,
+                "Liquidez Seca": liquidez_seca,
+                "Giro do Ativo": giro_ativo,
+                "Prazo Médio de Pagamento (dias)": prazo_medio_pagamento
+            })
+
+    df = pd.DataFrame(resultados).sort_values(["Empresa", "Ano"])
+    return df
+
+
+
 def analysis_for_tickers(tickers, start_date, end_date=None,
                          total_capital=100000.0, weights=None):
-    # preços e retornos por ativo
     returns_by_ticker = {}
     for t in tickers:
         months, prices = fetch_adj_close_monthly_end(t, start_date, end_date)
         rets = compute_monthly_returns_from_prices(prices)
         returns_by_ticker[t] = (months[1:], rets)
 
-    # meses comuns
     aligned, common_months = align_return_series(returns_by_ticker)
-
-    # métricas por ativo
     per_asset = {}
     for t in tickers:
         _, rets = returns_by_ticker[t]
@@ -176,25 +206,18 @@ def analysis_for_tickers(tickers, start_date, end_date=None,
             "n_months": len(rets)
         }
 
-    # correlações
     pairs_corr = {}
     for i in range(len(tickers)):
         for j in range(i + 1, len(tickers)):
             a, b = tickers[i], tickers[j]
             pairs_corr[(a, b)] = correlation(aligned.get(a, []), aligned.get(b, []))
 
-    # pesos normalizados
     w = normalize_weights(weights or {}, tickers)
-
-    # carteira
     port_mean = sum(w[t] * per_asset[t]["mean_return"] for t in tickers)
     port_monthly = compute_portfolio_monthly_returns(aligned, w)
     port_cum = cumulative_return(port_monthly)
-
-    # CAPM
     lista_capm = CAPM(aligned, common_months, start_date, end_date)
 
-    # impressão
     def fmt_pct(x): return f"{100 * x:,.3f}%"
 
     print("\n=== Pesos e Alocação ===")
@@ -253,3 +276,10 @@ def analysis_for_tickers(tickers, start_date, end_date=None,
 
 if __name__ == "__main__":
     analysis_for_tickers(TICKERS, START_DATE, END_DATE, TOTAL_CAPITAL, WEIGHTS)
+
+    print("\n\n📊 === ANÁLISE FUNDAMENTALISTA (2021–2024) ===")
+    df = fundamental_analysis(TICKERS)
+    if not df.empty:
+        print(df.to_string(index=False))
+    else:
+        print("⚠️ Não foi possível obter dados contábeis para as empresas.")
